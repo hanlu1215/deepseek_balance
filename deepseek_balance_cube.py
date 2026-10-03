@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""DeepSeek 余额小方块 —— 极简悬浮窗。
+r"""DeepSeek 余额小方块 —— 极简悬浮窗。
 
 显示内容只有两样：
     1. 余额数字（大字号，尽量占满卡片）
@@ -10,16 +10,53 @@
     · 大圆角卡片，四角圆润
     · 卡片里文字占比大，几乎没有多余留白
     · 底图逐行渲染成抗锯齿 PNG，边缘不会出现锯齿
+    · 余额数字每刷新一次换一种颜色（金→橘→红→蓝→青→白，可关）
 
 交互：
     左键点击  -> 木鱼「笃」一声 + 轻微 Q 弹一下 + 刷新余额
     拖动      -> 移动窗口
-    右键菜单  -> 刷新 / 置顶开关 / 点击音效开关 / 退出
+    右键菜单  -> 刷新 / 置顶开关 / 点击音效开关 / 颜色轮换开关 / 退出
     Esc       -> 退出
 
 配置：
-    顶部「配置区」里填 API_KEY；余额自动刷新间隔 BALANCE_REFRESH_SECONDS
-    就定义在它旁边，默认 10 秒刷新一次。
+    顶部「配置区」里填 API_KEY；刷新节奏由 BALANCE_REFRESH_SECONDS 控制，
+    两个都定义在文件开头的配置区。
+
+怎么给 DeepSeek API Key（两种方式，任选一种）：
+    方式一：把配置区的 API_KEY = "" 改成 API_KEY = "sk-你的key"。
+            最省事，双击快捷方式也能用；缺点是这个文件别发给别人。
+    方式二：用环境变量 DEEPSEEK_API_KEY，脚本启动时会自己读。
+            这是「临时」的变量，只在当前这个命令行窗口里有效，窗口一关就没了，
+            所以设完要在同一个窗口里启动脚本。三种窗口的写法：
+                PowerShell :  $env:DEEPSEEK_API_KEY = "sk-你的key"
+                cmd        :  set DEEPSEEK_API_KEY=sk-你的key
+                Git Bash   :  export DEEPSEEK_API_KEY=sk-你的key
+            别写成 `set DEEPSEEK_API_KEY=...` 就跑（那是 cmd 的写法）：
+            PowerShell 里的 set 只是建了个 PowerShell 变量，环境变量还是空的。
+
+    优先级：API_KEY 填了就用它，留空才回退到环境变量 DEEPSEEK_API_KEY。
+    用快捷方式 / pythonw 启动时没有终端可以设临时变量，这种情况请用方式一。
+
+不想看到黑色命令行窗口？用 pythonw.exe 启动，或者给它建个快捷方式：
+    目标(T)    : "…\pythonw.exe" "…\deepseek_balance_cube.py"
+    起始位置(S): 脚本所在文件夹
+    完整步骤（含开机自启）见同目录的 README.md。
+
+看到余额一直没出来，怎么排查：
+    在命令行里运行
+        python deepseek_balance_cube.py --check-key
+    它会告诉你 Key 是从哪儿读到的、掩码长什么样、接口返回了什么错误。
+    最常见的三个坑：
+      · 临时变量只在「设它的那个窗口」里有效：换窗口、双击图标、从编辑器
+        启动都读不到；脚本已经在跑的话，改完要关掉重开。
+      · PowerShell 里的 set 不是 cmd 的 set：`set DEEPSEEK_API_KEY=xxx` 不会
+        设置环境变量，要用 `$env:DEEPSEEK_API_KEY = "sk-xxx"`。
+      · 值里别带引号：`set DEEPSEEK_API_KEY="sk-xxx"` 会把引号一起存进去，
+        请求必然 401（脚本会尽量自动去掉，但最好一开始就别带）。
+
+余额自动刷新：默认是自适应的——平时 5 分钟看一眼，发现余额在掉就自动加密，
+    掉得越快刷得越勤，最快 30 秒；不动了再慢慢放回 5 分钟。
+    想固定间隔或彻底关掉，改 BALANCE_REFRESH_SECONDS 即可（见配置区）。
 
 依赖：只用 Python 标准库（tkinter）。卡片底图是自己逐行渲染出来的
       抗锯齿 PNG，所以不装 Pillow 也没有锯齿。
@@ -56,8 +93,10 @@ except ImportError:  # pragma: no cover - 只有非 Windows 才会进来
 API_KEY = ""
 API_KEY_ENV = "DEEPSEEK_API_KEY"
 
-# 余额自动刷新间隔（秒）：紧挨着 Key 定义，默认 10 秒刷新一次；0 = 不自动刷新
-BALANCE_REFRESH_SECONDS = 10
+# 余额自动刷新：0 = 自适应（默认，按消耗速度在 30 秒 ~ 5 分钟之间自动调节）
+#               正数 = 固定间隔（秒），例如 10 就是固定每 10 秒刷一次
+#               负数 = 关掉自动刷新，只能手动点方块刷新
+BALANCE_REFRESH_SECONDS = 0
 
 API_URL = "https://api.deepseek.com/user/balance"
 TIMEOUT_SECONDS = 20
@@ -91,6 +130,15 @@ CLICK_SOUND_VOLUME = 0.75      # 音量 0~1
 CLICK_SOUND_SECONDS = 0.15     # 声音长度（秒），木鱼是短促的“笃”
 CLICK_SOUND_FILE = "mokugyo_click.wav"   # 缓存文件，放在脚本同目录；已存在就直接用
 
+# ---- 自适应刷新节奏（BALANCE_REFRESH_SECONDS = 0 时生效）----
+REFRESH_MIN_SECONDS = 30       # 最快间隔：钱掉得快时最短 30 秒看一眼
+REFRESH_MAX_SECONDS = 300      # 最慢间隔：余额不动时 5 分钟看一眼
+REFRESH_JITTER = 0.05          # 间隔随机抖动 ±5%，避免每次都卡在同一秒
+REFRESH_RATE_TAU = 300.0       # 消耗速率的平滑时间常数（秒），越大越迟钝
+REFRESH_SHRINK = 0.5           # 这次余额变了：间隔 ×0.5（更快）
+REFRESH_GROW = 1.3             # 这次余额没变：间隔 ×1.3（更慢）
+BALANCE_STEP = 0.01            # 余额精度（元）：大概消耗这么多就值得看一眼
+
 # 窗口透明色：底图里等于这个颜色的像素会被系统挖空
 TRANSPARENT_COLOR = "#010203"
 TRANSPARENT_RGB = (1, 2, 3)
@@ -99,7 +147,6 @@ TRANSPARENT_RGB = (1, 2, 3)
 COLOR_TOP = (44, 47, 56)       # 卡片渐变起始
 COLOR_BOTTOM = (26, 28, 33)    # 卡片渐变结束
 COLOR_BORDER = (78, 84, 96)
-COLOR_AMOUNT = "#ffd88a"       # 余额数字
 COLOR_AMOUNT_DIM = "#7d7360"   # 刷新中
 COLOR_ERROR = "#ff7070"
 COLOR_MUTED = "#8b93a1"
@@ -107,6 +154,17 @@ COLOR_PEAK = "#ff8f5e"         # 峰：橙
 COLOR_PEAK_BG = "#3a2318"
 COLOR_OFF = "#4ede9a"          # 谷：绿
 COLOR_OFF_BG = "#16301f"
+
+# 余额数字的颜色：每刷新成功一次就换成下一个（第一个是原来的颜色）
+AMOUNT_COLOR_CYCLE = True      # 关掉就固定用列表里的第一个颜色
+AMOUNT_COLORS = (
+    "#ffd88a",                 # 金（原来的颜色）
+    "#ff9f45",                 # 橘
+    "#ff5f5f",                 # 红
+    "#5aa9ff",                 # 蓝
+    "#43d6c8",                 # 青
+    "#eef2f7",                 # 白
+)
 
 FONT_FAMILY = "Microsoft YaHei UI"
 
@@ -191,11 +249,45 @@ def format_remaining(delta: timedelta) -> str:
 
 
 # ---------------------------------------------------------------- 余额
+def clean_key(value: str) -> str:
+    """去掉首尾空白，以及误加进去的引号。
+
+    `set DEEPSEEK_API_KEY="sk-xxx"` 这种写法会把引号一起存进环境变量，
+    带着引号去请求必然 401，所以这里统一清一遍。
+    """
+    text = (value or "").strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    return text
+
+
 def resolve_api_key() -> str:
     """脚本里的 API_KEY 优先，其次环境变量。"""
     if API_KEY.strip():
-        return API_KEY.strip()
-    return (os.environ.get(API_KEY_ENV) or "").strip()
+        return clean_key(API_KEY)
+    return clean_key(os.environ.get(API_KEY_ENV) or "")
+
+
+def key_source() -> str:
+    """Key 是从哪儿读到的，排查时先看这一行。"""
+    if API_KEY.strip():
+        return "脚本里的 API_KEY"
+    if clean_key(os.environ.get(API_KEY_ENV) or ""):
+        return f"系统环境变量 {API_KEY_ENV}"
+    return "没找到"
+
+
+def mask_key(key: str) -> str:
+    """只露头尾，用来确认「读到的到底是哪一串」。"""
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:4]}{'*' * (len(key) - 6)}{key[-2:]}"
+
+
+def short_error(error: str) -> str:
+    """把错误压成一行短标签，好塞进卡片里显示。"""
+    head = error.split(":", 1)[0].strip() or error
+    return head[:10]
 
 
 def fetch_balance(api_key: str) -> dict[str, Any]:
@@ -226,6 +318,71 @@ def first_balance(payload: dict[str, Any] | None) -> str:
     if not infos:
         return "--"
     return str(infos[0].get("total_balance", "--"))
+
+
+# ---------------------------------------------------------------- 刷新节奏
+def parse_balance(text: str) -> float | None:
+    """把接口给的余额字符串转成数字；是 "--" 之类解析不了就返回 None。"""
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+class RefreshPacer:
+    """按「烧钱速度」自动决定下一次刷新间隔（30 秒 ~ 5 分钟）。
+
+    思路：
+      1. 每次拿到新余额，用 消耗量 / 间隔 估一个即时速率，再做时间加权平滑，
+         这样偶尔一次波动不会立刻改变节奏，但持续消耗会攒起来；
+      2. 间隔基线 = 一个最小可见变化（BALANCE_STEP 元）÷ 当前速率，
+         也就是「大概花掉 0.01 元就去看一眼」——速率越快间隔越短；
+      3. 这次余额变了就把间隔再砍一半（刚花过钱，盯紧点），
+         没变就放长 1.3 倍（钱没动，少打扰）——两者夹在 30 秒和 5 分钟之间；
+      4. 最后按 REFRESH_JITTER 加随机抖动，避免每次都踩在同一秒。
+    """
+
+    def __init__(
+        self,
+        minimum: float = REFRESH_MIN_SECONDS,
+        maximum: float = REFRESH_MAX_SECONDS,
+    ) -> None:
+        self.minimum = float(minimum)
+        self.maximum = float(maximum)
+        self.interval = float(maximum)      # 还没测出速率，先按最慢的来
+        self.rate = 0.0                     # 平滑后的消耗速率（元/秒）
+        self._balance: float | None = None
+        self._moment: float | None = None
+
+    def observe(self, balance: str | None, moment: float | None = None) -> float:
+        """喂入最新余额，返回下一次该等多少秒（已含随机抖动）。"""
+        now = time.monotonic() if moment is None else moment
+        value = parse_balance(balance or "")
+        if value is None:
+            return self.delay()             # 拿不到数字就维持当前节奏
+
+        if self._balance is not None and self._moment is not None:
+            elapsed = max(1.0, now - self._moment)
+            spent = max(0.0, self._balance - value)     # 充值导致的变多不算消耗
+            instant = spent / elapsed
+            blend = 1.0 - math.exp(-elapsed / REFRESH_RATE_TAU)
+            self.rate += (instant - self.rate) * blend
+
+            target = BALANCE_STEP / self.rate if self.rate > 0 else self.maximum
+            if spent > 0:
+                target = min(target, self.interval * REFRESH_SHRINK)
+            elif elapsed >= max(self.minimum, self.interval * 0.5):
+                # 只有观察窗口够长，「余额没变」才真的说明消耗慢；
+                # 手动连点这种 1 秒的窗口不做判断，免得把间隔越点越长
+                target = max(target, self.interval * REFRESH_GROW)
+            self.interval = min(self.maximum, max(self.minimum, target))
+
+        self._balance, self._moment = value, now
+        return self.delay()
+
+    def delay(self) -> float:
+        """当前间隔 + 随机抖动（秒）。"""
+        return self.interval * random.uniform(1.0 - REFRESH_JITTER, 1.0 + REFRESH_JITTER)
 
 
 # ---------------------------------------------------------------- 绘制
@@ -569,6 +726,10 @@ class BalanceCube:
         self._sprite_ok = True                          # Tk 不支持 PNG 时退回矢量绘制
         self.topmost = bool(ALWAYS_ON_TOP)
         self.sound = ClickSound()
+        self.pacer = RefreshPacer()      # 自适应刷新节奏（按消耗速度调节）
+        self.color_cycle = AMOUNT_COLOR_CYCLE   # 余额数字是否每次刷新换颜色
+        self._color_index = 0
+        self._color_started = False             # 第一次拿到的余额仍用原色
         self._press: tuple[int, int, int, int] | None = None   # x_root,y_root,win_x,win_y
         self._dragged = False
 
@@ -725,9 +886,11 @@ class BalanceCube:
         cx = x0 + width / 2
         zoom = scale * self.ui_scale             # 弹性动画缩放 + 高 DPI
 
-        # ---- 余额数字 ----
+        # ---- 余额数字：出错时直接把原因写在卡片上，别只给个红杠 ----
         amount = first_balance(self._state["payload"])
-        color = COLOR_AMOUNT
+        if self._state["error"]:
+            amount = short_error(self._state["error"])
+        color = AMOUNT_COLORS[self._color_index % len(AMOUNT_COLORS)]
         if self._state["error"]:
             color = COLOR_ERROR
         elif self._state["busy"]:
@@ -834,6 +997,8 @@ class BalanceCube:
         self.menu.add_checkbutton(label="置顶", variable=self._top_var, command=self._toggle_top)
         self._sound_var = tk.BooleanVar(master=self.root, value=self.sound.enabled)
         self.menu.add_checkbutton(label="点击音效", variable=self._sound_var, command=self._toggle_sound)
+        self._color_var = tk.BooleanVar(master=self.root, value=self.color_cycle)
+        self.menu.add_checkbutton(label="颜色轮换", variable=self._color_var, command=self._toggle_color_cycle)
         self.menu.add_separator()
         self.menu.add_command(label="退出", command=self._quit)
 
@@ -851,6 +1016,13 @@ class BalanceCube:
         self.sound.enabled = bool(self._sound_var.get())
         if self.sound.enabled:
             self.sound.play()        # 重新打开时立刻响一声，方便确认
+
+    def _toggle_color_cycle(self) -> None:
+        """菜单里的「颜色轮换」：关掉就回到第一个颜色，不再变。"""
+        self.color_cycle = bool(self._color_var.get())
+        if not self.color_cycle:
+            self._color_index = 0
+        self._redraw()
 
     def _on_press(self, event: tk.Event) -> None:
         self._press = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
@@ -927,11 +1099,25 @@ class BalanceCube:
             self._state["payload"] = payload
             self._state["error"] = ""
             self._state["last_ok"] = time.time()
+            if self.color_cycle and self._color_started:
+                # 每刷到一次新数据就换下一个颜色（启动那一次仍显示原来的颜色）
+                self._color_index = (self._color_index + 1) % len(AMOUNT_COLORS)
+            self._color_started = True
         else:
             self._state["error"] = error
         self._redraw()
-        if BALANCE_REFRESH_SECONDS > 0 and self._refresh_job is None:
-            self._refresh_job = self.root.after(BALANCE_REFRESH_SECONDS * 1000, self.refresh)
+        if BALANCE_REFRESH_SECONDS < 0 or self._refresh_job is not None:
+            return                      # 负数 = 关掉自动刷新，只留手动点
+        delay = self._next_delay(fresh=payload is not None)
+        self._refresh_job = self.root.after(int(delay * 1000), self.refresh)
+
+    def _next_delay(self, fresh: bool) -> float:
+        """下一次自动刷新等多少秒：固定间隔 or 自适应节奏。"""
+        if BALANCE_REFRESH_SECONDS > 0:
+            return float(BALANCE_REFRESH_SECONDS)
+        if not fresh:
+            return self.pacer.delay()   # 这次没拿到数据，维持当前节奏再来
+        return self.pacer.observe(first_balance(self._state["payload"]))
 
     def _tick(self) -> None:
         """每秒刷新一次峰谷倒计时（重绘本身很轻，卡片底图有缓存）。"""
@@ -958,13 +1144,76 @@ def math_exp_decay(progress: float) -> float:
     return math.exp(-4.2 * progress) * math.cos(11.0 * progress)
 
 
+def check_api_key() -> int:
+    """命令行排查：Key 从哪儿来、长什么样、接口到底怎么回。
+
+    对应命令：python deepseek_balance_cube.py --check-key
+    0 = 一切正常，1 = 请求失败，2 = 根本没找到 Key。
+    """
+    raw = os.environ.get(API_KEY_ENV) or ""
+    key = resolve_api_key()
+    print(f"Key 来源：{key_source()}")
+
+    if not key:
+        print()
+        print("没有读到 Key。两种给 Key 的方式（二选一）：")
+        print(f'  1) 打开脚本，把配置区的 API_KEY = "" 改成 API_KEY = "sk-你的key"')
+        print(f"  2) 设一个临时的环境变量 {API_KEY_ENV}，然后「在同一个窗口里」启动脚本：")
+        print(f'       PowerShell :  $env:{API_KEY_ENV} = "sk-你的key"')
+        print(f"       cmd        :  set {API_KEY_ENV}=sk-你的key")
+        print(f"       Git Bash   :  export {API_KEY_ENV}=sk-你的key")
+        print()
+        print("两个最容易踩的坑：")
+        print(f"  · PowerShell 里的 set 不是 cmd 的 set：`set {API_KEY_ENV}=xxx` 不会设置")
+        print("    环境变量，只是建了个名字里带等号的 PowerShell 变量，所以 $env: 里还是空的。")
+        print("  · 临时变量只活在这个窗口里：双击图标、换个窗口、从编辑器启动都读不到；")
+        print("    脚本已经在跑的话，设完要关掉重开。想双击就能用，请走方式 1。")
+        return 2
+
+    print(f"Key 掩码：{mask_key(key)}    长度：{len(key)}")
+    if raw.strip()[:1] in "\"'" or raw.strip()[-1:] in "\"'":
+        print("提醒：环境变量里的值带了引号，脚本已自动去掉；建议重新设置成不带引号的值。")
+    if not key.startswith("sk-"):
+        print("提醒：DeepSeek 的 Key 一般以 sk- 开头，这个看着不太像。")
+
+    print(f"正在请求 {API_URL} …")
+    try:
+        payload = fetch_balance(key)
+    except RuntimeError as error:
+        print(f"结果：失败 —— {error}")
+        print()
+        print("对号入座：")
+        print("  · Key 无效 / 401        → Key 抄错了、带引号了，或者已经被删掉")
+        print("  · 余额不足 402          → 账户欠费，去官网充值")
+        print("  · 网络不可达            → 断网、需要代理/VPN，或防火墙拦了 api.deepseek.com")
+        print("  · 请求过频 429          → 等一下再试")
+        return 1
+
+    currency = ""
+    infos = payload.get("balance_infos") or []
+    if infos:
+        currency = str(infos[0].get("currency", ""))
+    print(f"结果：成功，余额 {first_balance(payload)} {currency}")
+    return 0
+
+
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="DeepSeek 余额小方块")
     parser.add_argument("--demo", action="store_true", help="用假数据渲染，不发起网络请求")
     parser.add_argument("--self-test", type=float, default=0.0, metavar="秒", help="渲染指定秒数后退出")
+    parser.add_argument("--check-key", action="store_true", help="只检查 Key 和网络，不开窗口")
     args = parser.parse_args()
+    if args.check_key:
+        sys.exit(check_api_key())
+    if not args.demo and not resolve_api_key():
+        print(
+            "没找到 DeepSeek API Key：可以填脚本配置区的 API_KEY，"
+            f"或设置环境变量 {API_KEY_ENV}；"
+            "详细排查请运行: python deepseek_balance_cube.py --check-key",
+            file=sys.stderr,
+        )
     try:
         BalanceCube(demo=args.demo, self_test=args.self_test).run()
     except tk.TclError as error:
