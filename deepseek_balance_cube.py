@@ -9,9 +9,10 @@
 外观：
     · 大圆角卡片，四角圆润
     · 卡片里文字占比大，几乎没有多余留白
+    · 底图逐行渲染成抗锯齿 PNG，边缘不会出现锯齿
 
 交互：
-    左键点击  -> Q 弹一下并刷新余额
+    左键点击  -> 轻微 Q 弹一下（整块一起缩放）并刷新余额
     拖动      -> 移动窗口
     右键菜单  -> 刷新 / 置顶开关 / 退出
     Esc       -> 退出
@@ -20,16 +21,18 @@
     顶部「配置区」里填 API_KEY；余额自动刷新间隔 BALANCE_REFRESH_SECONDS
     就定义在它旁边，默认 10 秒刷新一次。
 
-依赖：只用 Python 标准库（tkinter）。没有 Pillow 也能跑；
-      检测到 Pillow 会自动升级成抗锯齿 + 渐变版本。
+依赖：只用 Python 标准库（tkinter）。卡片底图是自己逐行渲染出来的
+      抗锯齿 PNG，所以不装 Pillow 也没有锯齿。
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
 import queue
+import struct
 import sys
 import threading
 import time
@@ -37,15 +40,9 @@ import tkinter as tk
 import tkinter.font as tkfont
 import urllib.error
 import urllib.request
+import zlib
 from datetime import datetime, timedelta
 from typing import Any
-
-try:  # 可选增强
-    from PIL import Image, ImageDraw, ImageTk
-
-    HAS_PIL = True
-except Exception:  # noqa: BLE001 - 没装 Pillow 就走纯 Canvas 路径
-    HAS_PIL = False
 
 # ============================================================================
 #  ★ 配置区：把 Key 写在这里，非空则优先使用；留空则回退到环境变量
@@ -75,6 +72,16 @@ PILL_PAD_X = 10                # 徽标左右内边距
 PILL_GAP = 7                   # 徽标内「峰/谷」与倒计时的间距
 PILL_PAD_Y = 2                 # 徽标上下内边距
 PILL_SIDE_MARGIN = 13          # 徽标距离卡片左右边缘的最小留白
+BORDER_WIDTH = 1.2             # 卡片描边宽度（像素）
+
+# ---- 动画（“Q 弹”）----
+BOUNCE_AMPLITUDE = 0.06        # 缩放幅度：最小缩到 94%，越小越含蓄
+BOUNCE_DURATION = 0.55         # 一次 Q 弹的时长（秒）
+SPRITE_SCALE_STEP = 0.004      # 底图按缩放档位缓存，避免每帧重渲染
+
+# 窗口透明色：底图里等于这个颜色的像素会被系统挖空
+TRANSPARENT_COLOR = "#010203"
+TRANSPARENT_RGB = (1, 2, 3)
 
 # ---- 配色 ----
 COLOR_TOP = (44, 47, 56)       # 卡片渐变起始
@@ -210,34 +217,130 @@ def first_balance(payload: dict[str, Any] | None) -> str:
 
 
 # ---------------------------------------------------------------- 绘制
-def _rounded_rect(draw: ImageDraw.ImageDraw, box, radius: int, **kwargs) -> None:
-    draw.rounded_rectangle(box, radius=radius, **kwargs)
+def _corner_inset(distance: float, radius: float) -> float:
+    """距上/下边缘 distance 处，圆角造成的水平内缩量（圆角矩形的精确解）。"""
+    if radius <= 0 or distance <= 0 or distance >= radius:
+        return 0.0
+    return radius - math.sqrt(max(0.0, radius * radius - (radius - distance) ** 2))
 
 
-def build_card_pil(width: int, height: int, radius: int) -> Image.Image:
-    """抗锯齿版本：垂直渐变 + 描边的圆角卡片。"""
-    scale = 3
-    big_w, big_h = width * scale, height * scale
+def _row_span(row: int, box: tuple[float, float, float, float], radius: float) -> tuple[float, float] | None:
+    """像素行 row 在圆角矩形里的水平覆盖区间；整行都在外面时返回 None。"""
+    x0, y0, x1, y1 = box
+    center = row + 0.5
+    if center <= y0 or center >= y1 or x1 <= x0:
+        return None
+    inset = max(_corner_inset(center - y0, radius), _corner_inset(y1 - center, radius))
+    return x0 + inset, x1 - inset
 
-    body = Image.new("RGBA", (big_w, big_h), (0, 0, 0, 0))
-    card_box = (0, 0, big_w - 1, big_h - 1)
-    mask = Image.new("L", (big_w, big_h), 0)
-    _rounded_rect(ImageDraw.Draw(mask), card_box, radius * scale, fill=255)
 
-    gradient = Image.new("RGB", (big_w, big_h), COLOR_BOTTOM)
-    painter = ImageDraw.Draw(gradient)
-    for y in range(big_h):
-        t = y / max(1, big_h - 1)
-        painter.line(
-            [(0, y), (big_w, y)],
-            fill=tuple(int(COLOR_TOP[i] + (COLOR_BOTTOM[i] - COLOR_TOP[i]) * t) for i in range(3)),
+def _row_coverage(row: int, y0: float, y1: float) -> float:
+    """像素行 row 被 [y0, y1] 纵向覆盖的比例，用来给上/下边缘做抗锯齿。"""
+    covered = min(row + 1.0, y1) - max(float(row), y0)
+    return min(1.0, max(0.0, covered))
+
+
+def _paint_row(row: bytearray, width: int, lo: float, hi: float, color: tuple[int, int, int], alpha: float = 1.0) -> None:
+    """把 [lo, hi) 按覆盖率混进这一行：中间整段直接填，只有边界像素做混色。"""
+    if alpha <= 0.001 or hi <= lo:
+        return
+    lo = max(0.0, lo)
+    hi = min(float(width), hi)
+    if hi <= lo:
+        return
+
+    full_lo = max(0, int(math.ceil(lo - 1e-9)))
+    full_hi = min(width - 1, int(math.floor(hi + 1e-9)) - 1)
+    if full_hi >= full_lo:
+        if alpha >= 0.999:
+            row[full_lo * 3:(full_hi + 1) * 3] = bytes(color) * (full_hi - full_lo + 1)
+        else:
+            for index in range(full_lo, full_hi + 1):
+                offset = index * 3
+                for channel in range(3):
+                    current = row[offset + channel]
+                    row[offset + channel] = int(current + (color[channel] - current) * alpha)
+
+    for index in (int(math.floor(lo)), int(math.ceil(hi)) - 1):
+        if not 0 <= index < width or full_lo <= index <= full_hi:
+            continue
+        coverage = min(1.0, (min(hi, index + 1.0) - max(lo, float(index))) * alpha)
+        if coverage <= 0.001:
+            continue
+        offset = index * 3
+        for channel in range(3):
+            current = row[offset + channel]
+            row[offset + channel] = int(current + (color[channel] - current) * coverage)
+
+
+def _gradient_at(row: int, y0: float, y1: float) -> tuple[int, int, int]:
+    span = max(1.0, y1 - y0)
+    t = min(1.0, max(0.0, (row + 0.5 - y0) / span))
+    return tuple(
+        int(COLOR_TOP[i] + (COLOR_BOTTOM[i] - COLOR_TOP[i]) * t) for i in range(3)
+    )  # type: ignore[return-value]
+
+
+def _encode_png(width: int, height: int, rows: list[bytes]) -> bytes:
+    """把逐行 RGB 数据打包成 PNG（Tk 8.6+ 自带 PNG 解码）。"""
+    raw = b"".join(b"\x00" + row for row in rows)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + tag + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
         )
-    body.paste(gradient, (0, 0), mask)
-    _rounded_rect(
-        ImageDraw.Draw(body), card_box, radius * scale,
-        outline=COLOR_BORDER + (255,), width=scale,
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)   # 8bit RGB
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw, 6))
+        + chunk(b"IEND", b"")
     )
-    return body.resize((width, height), Image.LANCZOS)
+
+
+def render_card_png(
+    width: int,
+    height: int,
+    card: tuple[float, float, float, float],
+    radius: float,
+    pill: tuple[float, float, float, float] | None,
+    pill_color: tuple[int, int, int],
+) -> bytes:
+    """逐行渲染卡片底图：圆角 + 垂直渐变 + 描边（全部带抗锯齿）。
+
+    每行先算出圆角矩形在该行的水平区间，区间中间整段填充、只有左右边界
+    那一两个像素按覆盖率混色；上下边缘再用行覆盖率补一次，所以四边都不会
+    出现楼梯状锯齿。徽标同理画在同一张底图里，边缘自然也是平滑的。
+    """
+    rows: list[bytes] = []
+    for row in range(height):
+        line = bytearray(bytes(TRANSPARENT_RGB) * width)
+
+        coverage = _row_coverage(row, card[1], card[3])
+        span = _row_span(row, card, radius) if coverage > 0 else None
+        if span is not None:
+            _paint_row(line, width, span[0], span[1], COLOR_BORDER, coverage)
+            _paint_row(
+                line, width, span[0] + BORDER_WIDTH, span[1] - BORDER_WIDTH,
+                _gradient_at(row, card[1], card[3]), coverage,
+            )
+
+        if pill is not None:
+            pill_radius = min((pill[2] - pill[0]) / 2, (pill[3] - pill[1]) / 2)
+            pill_coverage = _row_coverage(row, pill[1], pill[3])
+            pill_span = _row_span(row, pill, pill_radius) if pill_coverage > 0 else None
+            if pill_span is not None:
+                _paint_row(line, width, pill_span[0], pill_span[1], pill_color, pill_coverage)
+
+        rows.append(bytes(line))
+    return _encode_png(width, height, rows)
+
+
+def canonical_clock(clock: str) -> str:
+    """把倒计时里的数字都换成等宽的 8：徽标宽度就不会随秒数跳动。"""
+    return "".join("8" if char.isdigit() else char for char in clock)
 
 
 def round_rect_points(x0: float, y0: float, x1: float, y1: float, r: float, steps: int = 8) -> list[float]:
@@ -266,6 +369,11 @@ def hex_color(rgb: tuple[int, int, int]) -> str:
     return "#%02x%02x%02x" % rgb
 
 
+def hex_to_rgb(color: str) -> tuple[int, int, int]:
+    color = color.lstrip("#")
+    return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+
+
 class BalanceCube:
     def __init__(self, demo: bool = False, self_test: float = 0.0) -> None:
         self.demo = demo
@@ -285,7 +393,7 @@ class BalanceCube:
         self.total_h = self.px_h + self.px_margin * 2
         self._place_window()
 
-        transparent = "#010203"
+        transparent = TRANSPARENT_COLOR
         self.root.config(bg=transparent)
         self.canvas_bg = transparent
         try:
@@ -299,9 +407,6 @@ class BalanceCube:
         )
         self.canvas.pack()
 
-        self._card_image = None          # PIL 底图（没有 Pillow 时为 None）
-        self._build_card_sprite()
-
         # 状态
         self._state: dict[str, Any] = {
             "payload": None, "error": "", "busy": False, "last_ok": 0.0,
@@ -314,6 +419,9 @@ class BalanceCube:
         self._refresh_job: str | None = None
         self._pending: queue.Queue = queue.Queue()
         self._fonts: dict[tuple[int, str], tkfont.Font] = {}
+        self._sprites: dict[int, tk.PhotoImage] = {}   # 底图按缩放档位缓存
+        self._sprite_signature: tuple[Any, ...] | None = None
+        self._sprite_ok = True                          # Tk 不支持 PNG 时退回矢量绘制
         self._press: tuple[int, int, int, int] | None = None   # x_root,y_root,win_x,win_y
         self._dragged = False
 
@@ -339,12 +447,6 @@ class BalanceCube:
         x, y = positions.get(START_AT, positions["top-right"])
         self.root.geometry(f"{self.total_w}x{self.total_h}+{max(0, x)}+{max(0, y)}")
 
-    # -- 卡片底图
-    def _build_card_sprite(self) -> None:
-        if HAS_PIL:
-            image = build_card_pil(self.px_w, self.px_h, self.px_r)
-            self._card_image = ImageTk.PhotoImage(image)
-
     # -- 坐标（含四周透明留白）
     def card_left(self, scale: float | None = None) -> float:
         s = self._scale if scale is None else scale
@@ -364,71 +466,80 @@ class BalanceCube:
 
     # -- 渲染
     def _redraw(self) -> None:
-        """重画卡片本体与内容。"""
-        self.canvas.delete("card")
-        x0 = self.card_left()
-        y0 = self.card_top()
-        x1 = x0 + self.card_width()
-        y1 = y0 + self.card_height()
-        radius = max(4.0, self.px_r * self._scale)
+        """重画一帧：底图（带抗锯齿）+ 文字。
 
-        if self._card_image is not None and abs(self._scale - 1.0) < 1e-6:
-            self.canvas.create_image(0, 0, image=self._card_image, anchor="nw", tags=("card",))
-        else:
-            self._draw_card_body(x0, y0, x1, y1, radius)
-        self._draw_content(x0, y0, x1, y1)
-
-    def _draw_card_body(self, x0: float, y0: float, x1: float, y1: float, radius: float) -> None:
-        """纯 Canvas 卡片：切片式渐变填充 + 描边（无需 Pillow）。
-
-        注意不能用"等高色带"堆叠：每带只有几像素高却套用几十像素的圆角，
-        会退化成胶囊形状，堆起来就是锯齿边。改成从当前行填到底的切片，
-        每片的左右内缩量由圆形方程算出，拼出真正的圆角。
+        每次都要 delete("all")：徽标和文字原来没有 tag，只删 "card" 会让
+        上一帧的旧徽标留在画布上，Q 弹时就会看到一条越来越长的黑色残影。
         """
+        self.canvas.delete("all")
+        layout = self._layout(self._sprite_scale())
+        image = self._sprite_for(layout)
+        if image is not None:
+            self.canvas.create_image(0, 0, image=image, anchor="nw", tags=("card",))
+        else:
+            self._draw_card_vector(layout)
+        self._draw_content(layout)
+
+    def _sprite_scale(self) -> float:
+        """把弹性缩放量化成档位，同一档位的底图可以直接复用。"""
+        return max(0.5, round(self._scale / SPRITE_SCALE_STEP) * SPRITE_SCALE_STEP)
+
+    def _sprite_for(self, layout: dict[str, Any]) -> tk.PhotoImage | None:
+        """取当前档位的底图；同一档位只在卡片/徽标尺寸变化时重渲染。"""
+        if not self._sprite_ok:
+            return None
+        # 签名只放「和缩放无关」的内容：峰/谷、倒计时位数、徽标底色。
+        # 缩放档位本身是缓存键，不能再进签名，否则每帧都会把缓存清空。
+        signature = layout["pill_signature"]
+        if signature != self._sprite_signature:
+            self._sprites.clear()
+            self._sprite_signature = signature
+        image = self._sprites.get(layout["sprite_key"])
+        if image is not None:
+            return image
+        try:
+            png = render_card_png(
+                self.total_w, self.total_h, layout["card"], layout["radius"],
+                layout["pill"], layout["pill_bg_rgb"],
+            )
+            image = tk.PhotoImage(master=self.root, data=base64.b64encode(png).decode("ascii"))
+        except (tk.TclError, ValueError):
+            self._sprite_ok = False     # Tk 太老不认 PNG：退回矢量绘制
+            return None
+        if len(self._sprites) > 64:
+            self._sprites.clear()
+        self._sprites[layout["sprite_key"]] = image
+        return image
+
+    def _draw_card_vector(self, layout: dict[str, Any]) -> None:
+        """没有 PNG 支持时的兜底：用多边形拼出卡片（会有轻微锯齿）。"""
+        x0, y0, x1, y1 = layout["card"]
+        radius = min(layout["radius"], (x1 - x0) / 2, (y1 - y0) / 2)
         height = y1 - y0
-        radius = max(0.0, min(radius, (x1 - x0) / 2, height / 2))
-        steps = max(24, int(height / 3))
+        steps = max(24, int(height / 2))
         for index in range(steps):
             top = y0 + height * index / steps
             bottom = y0 + height * (index + 1) / steps
             inset = max(
-                self._corner_inset(top - y0, radius),
-                self._corner_inset(y1 - bottom, radius),
+                _corner_inset(top - y0, radius),
+                _corner_inset(y1 - bottom, radius),
             )
             self.canvas.create_polygon(
                 x0 + inset, top, x1 - inset, top,
                 x1 - inset, bottom, x0 + inset, bottom,
-                fill=hex_color(self._gradient_color((index + 0.5) / steps)),
+                fill=hex_color(_gradient_at(int(top), y0, y1)),
                 outline="", tags=("card",),
             )
         self.canvas.create_polygon(
-            round_rect_points(x0, y0, x1, y1, radius),
+            round_rect_points(x0, y0, x1, y1, radius, steps=24),
             fill="", outline=hex_color(COLOR_BORDER), width=1, tags=("card",),
         )
-
-    @staticmethod
-    def _corner_inset(distance_from_edge: float, radius: float) -> float:
-        """距上/下边缘 distance_from_edge 处，圆角造成的水平内缩量。"""
-        if radius <= 0 or distance_from_edge >= radius:
-            return 0.0
-        return radius - math.sqrt(max(0.0, radius * radius - (radius - distance_from_edge) ** 2))
-
-    @staticmethod
-    def _gradient_color(t: float) -> tuple[int, int, int]:
-        return tuple(
-            int(COLOR_TOP[i] + (COLOR_BOTTOM[i] - COLOR_TOP[i]) * t) for i in range(3)
-        )  # type: ignore[return-value]
-
-    @staticmethod
-    def _blend(base: str, other: str, alpha: float) -> str:
-        def parts(color: str) -> tuple[int, int, int]:
-            color = color.lstrip("#")
-            return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
-
-        if not base.startswith("#") or len(base) != 7:
-            base = "#101216"
-        b, o = parts(base), parts(other)
-        return "#%02x%02x%02x" % tuple(int(b[i] + (o[i] - b[i]) * alpha) for i in range(3))
+        pill = layout["pill"]
+        if pill is not None:
+            self.canvas.create_polygon(
+                round_rect_points(*pill, min((pill[2] - pill[0]) / 2, (pill[3] - pill[1]) / 2), steps=24),
+                fill=layout["pill_bg"], outline="", tags=("card",),
+            )
 
     def _font(self, size_px: float, weight: str = "normal") -> tkfont.Font:
         """按像素取字体（带缓存）。
@@ -452,26 +563,27 @@ class BalanceCube:
             font = self._font(size_px * max_width / text_width, weight)
         return font
 
-    def _draw_content(self, x0: float, y0: float, x1: float, y1: float) -> None:
-        width = x1 - x0
-        height = y1 - y0
-        cx = x0 + width / 2
-        zoom = self._scale * self.ui_scale        # 弹性动画缩放 + 高 DPI
-        max_text_w = width * TEXT_WIDTH_RATIO
+    def _layout(self, scale: float) -> dict[str, Any]:
+        """算好一帧的全部几何：卡片、圆角、徽标矩形、字号、文字落点。
 
-        # ---- 余额数字：字号先顶满卡片，再按文本长度收一点 ----
+        底图渲染和文字绘制共用这份结果，所以文字一定落在徽标正中间，
+        Q 弹时两者也是同一个缩放档位，不会上下不一致。
+        """
+        x0 = self.px_margin + self.px_w * (1 - scale) / 2
+        y0 = self.px_margin + self.px_h * (1 - scale) / 2
+        x1, y1 = x0 + self.px_w * scale, y0 + self.px_h * scale
+        width, height = x1 - x0, y1 - y0
+        cx = x0 + width / 2
+        zoom = scale * self.ui_scale             # 弹性动画缩放 + 高 DPI
+
+        # ---- 余额数字 ----
         amount = first_balance(self._state["payload"])
         color = COLOR_AMOUNT
         if self._state["error"]:
             color = COLOR_ERROR
         elif self._state["busy"]:
             color = COLOR_AMOUNT_DIM
-
-        amount_font = self._fit_font(amount, AMOUNT_FONT_PX * zoom, max_text_w, "bold")
-        self.canvas.create_text(
-            cx, y0 + height * AMOUNT_CENTER_Y, text=amount, fill=color,
-            font=amount_font, anchor="center",
-        )
+        amount_font = self._fit_font(amount, AMOUNT_FONT_PX * zoom, width * TEXT_WIDTH_RATIO, "bold")
 
         # ---- 峰 / 谷 徽标 + 时:分:秒 倒计时 ----
         now = datetime.now()
@@ -482,38 +594,61 @@ class BalanceCube:
         bg = COLOR_PEAK_BG if peak else COLOR_OFF_BG
 
         pill_px = PILL_FONT_PX * zoom
-        pad = PILL_PAD_X * zoom
-        gap = PILL_GAP * zoom
+        pad, gap = PILL_PAD_X * zoom, PILL_GAP * zoom
         font = self._font(pill_px, "bold")
+        # 宽度按「把数字都换成 8」的等宽版本算：秒数变化时徽标不会抖
         label_w = font.measure(label)
-        clock_w = font.measure(clock)
+        clock_w = font.measure(canonical_clock(clock))
         pill_w = label_w + gap + clock_w + pad * 2
 
         # 长假时倒计时会出现三位数小时，整块徽标等比缩小也要塞进卡片
         avail = width - 2 * PILL_SIDE_MARGIN * zoom
-        if pill_w > avail:
+        if pill_w > avail > 0:
             shrink = avail / pill_w
+            pad, gap = pad * shrink, gap * shrink
             font = self._font(pill_px * shrink, "bold")
-            pad *= shrink
-            gap *= shrink
             label_w = font.measure(label)
-            clock_w = font.measure(clock)
+            clock_w = font.measure(canonical_clock(clock))
             pill_w = label_w + gap + clock_w + pad * 2
 
         pill_h = font.metrics("linespace") + 2 * PILL_PAD_Y * zoom
-        px0 = cx - pill_w / 2
-        py0 = y0 + height * PILL_CENTER_Y - pill_h / 2
-        self.canvas.create_polygon(
-            round_rect_points(px0, py0, px0 + pill_w, py0 + pill_h, pill_h / 2),
-            fill=bg, outline="", smooth=True,
+        cx_pill = cx - pill_w / 2
+        cy_pill = y0 + height * PILL_CENTER_Y
+        pill = (cx_pill, cy_pill - pill_h / 2, cx_pill + pill_w, cy_pill + pill_h / 2)
+
+        return {
+            "card": (x0, y0, x1, y1),
+            "radius": max(2.0, min(self.px_r * scale, width / 2, height / 2)),
+            "sprite_key": int(round(scale * 1000)),
+            "amount": amount,
+            "amount_color": color,
+            "amount_font": amount_font,
+            "amount_pos": (cx, y0 + height * AMOUNT_CENTER_Y),
+            "pill": pill,
+            "pill_bg": bg,
+            "pill_bg_rgb": hex_to_rgb(bg),
+            "pill_fg": fg,
+            "pill_font": font,
+            "label": label,
+            "clock": clock,
+            "pill_signature": (label, canonical_clock(clock), bg, round(self.ui_scale, 4)),
+            "label_pos": (cx_pill + pad + label_w / 2, cy_pill),
+            "clock_pos": (cx_pill + pill_w - pad - font.measure(clock) / 2, cy_pill),
+        }
+
+    def _draw_content(self, layout: dict[str, Any]) -> None:
+        """文字单独用 Tk 文本画（系统自带抗锯齿），底图里只有形状。"""
+        self.canvas.create_text(
+            *layout["amount_pos"], text=layout["amount"], fill=layout["amount_color"],
+            font=layout["amount_font"], anchor="center", tags=("card",),
         )
         self.canvas.create_text(
-            px0 + pad + label_w / 2, py0 + pill_h / 2,
-            text=label, fill=fg, font=font,
+            *layout["label_pos"], text=layout["label"], fill=layout["pill_fg"],
+            font=layout["pill_font"], anchor="center", tags=("card",),
         )
         self.canvas.create_text(
-            px0 + pill_w - pad - clock_w / 2, py0 + pill_h / 2,
-            text=clock, fill=fg, font=font,
+            *layout["clock_pos"], text=layout["clock"], fill=layout["pill_fg"],
+            font=layout["pill_font"], anchor="center", tags=("card",),
         )
 
     # -- 弹性动画
@@ -525,15 +660,15 @@ class BalanceCube:
 
     def _animate(self) -> None:
         elapsed = time.monotonic() - self._anim_start
-        duration = 0.62
+        duration = BOUNCE_DURATION
         if elapsed >= duration:
             self._scale = 1.0
             self._redraw()
             self._anim_job = None
             return
         progress = elapsed / duration
-        # 欠阻尼弹簧：0.78 -> 1.0，回弹两下
-        self._scale = 1.0 - 0.22 * math_exp_decay(progress)
+        # 欠阻尼弹簧：1-幅度 -> 1.0，回弹两下（幅度小，含蓄一点）
+        self._scale = 1.0 - BOUNCE_AMPLITUDE * math_exp_decay(progress)
         self._redraw()
         self._anim_job = self.root.after(16, self._animate)
 
