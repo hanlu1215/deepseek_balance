@@ -12,9 +12,9 @@
     · 底图逐行渲染成抗锯齿 PNG，边缘不会出现锯齿
 
 交互：
-    左键点击  -> 轻微 Q 弹一下（整块一起缩放）并刷新余额
+    左键点击  -> 木鱼「笃」一声 + 轻微 Q 弹一下 + 刷新余额
     拖动      -> 移动窗口
-    右键菜单  -> 刷新 / 置顶开关 / 退出
+    右键菜单  -> 刷新 / 置顶开关 / 点击音效开关 / 退出
     Esc       -> 退出
 
 配置：
@@ -32,6 +32,7 @@ import json
 import math
 import os
 import queue
+import random
 import struct
 import sys
 import threading
@@ -43,6 +44,11 @@ import urllib.request
 import zlib
 from datetime import datetime, timedelta
 from typing import Any
+
+try:  # 点击音效走系统 API 播放内存里的 WAV，Windows 以外自动静音
+    import winsound
+except ImportError:  # pragma: no cover - 只有非 Windows 才会进来
+    winsound = None
 
 # ============================================================================
 #  ★ 配置区：把 Key 写在这里，非空则优先使用；留空则回退到环境变量
@@ -78,6 +84,12 @@ BORDER_WIDTH = 1.2             # 卡片描边宽度（像素）
 BOUNCE_AMPLITUDE = 0.06        # 缩放幅度：最小缩到 94%，越小越含蓄
 BOUNCE_DURATION = 0.55         # 一次 Q 弹的时长（秒）
 SPRITE_SCALE_STEP = 0.004      # 底图按缩放档位缓存，避免每帧重渲染
+
+# ---- 点击音效（木鱼）----
+CLICK_SOUND = True             # 点击刷新时敲一记木鱼
+CLICK_SOUND_VOLUME = 0.75      # 音量 0~1
+CLICK_SOUND_SECONDS = 0.15     # 声音长度（秒），木鱼是短促的“笃”
+CLICK_SOUND_FILE = "mokugyo_click.wav"   # 缓存文件，放在脚本同目录；已存在就直接用
 
 # 窗口透明色：底图里等于这个颜色的像素会被系统挖空
 TRANSPARENT_COLOR = "#010203"
@@ -374,6 +386,139 @@ def hex_to_rgb(color: str) -> tuple[int, int, int]:
     return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
 
 
+# ---------------------------------------------------------------- 音效
+def _wav_bytes(samples: list[int], sample_rate: int) -> bytes:
+    """把 16bit 单声道样本打包成 WAV（只在内存里，不落盘）。"""
+    frames = struct.pack("<%dh" % len(samples), *samples)
+    return (
+        b"RIFF" + struct.pack("<I", 36 + len(frames)) + b"WAVE"
+        + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16)
+        + b"data" + struct.pack("<I", len(frames)) + frames
+    )
+
+
+def build_mokugyo_wav(volume: float = CLICK_SOUND_VOLUME) -> bytes:
+    """合成一记木鱼「笃」。
+
+    木鱼的声音 = 极短的敲击噪声 + 几个快速衰减的谐振峰（略带非谐波）+ 木腔的
+    低频体感，再叠一点音高下滑。全程纯计算，不需要任何音频素材。
+    """
+    sample_rate = 44100
+    count = int(sample_rate * CLICK_SOUND_SECONDS)
+    # (频率 Hz, 振幅, 衰减时间常数 秒)
+    partials = (
+        (430.0, 0.30, 0.045),      # 木腔的低频“闷”
+        (1180.0, 1.00, 0.030),     # 主音
+        (1810.0, 0.52, 0.018),     # 非谐波泛音，木头味就靠它
+        (2470.0, 0.24, 0.011),
+    )
+    rng = random.Random(20261003)          # 固定种子：每次听起来都一样
+    noise = [rng.uniform(-1.0, 1.0) for _ in range(count)]
+
+    raw: list[float] = []
+    for index in range(count):
+        t = index / sample_rate
+        bend = 1.0 + 0.055 * math.exp(-t / 0.022)          # 敲下去那一瞬间略高
+        value = 0.0
+        for freq, amp, tau in partials:
+            value += amp * math.exp(-t / tau) * math.sin(2 * math.pi * freq * bend * t)
+        value += 0.55 * noise[index] * math.exp(-t / 0.0014)   # 起手的敲击声
+        value *= 1.0 - math.exp(-t / 0.0004)                   # 0.4ms 淡入，防爆音
+        raw.append(value)
+
+    peak = max(abs(value) for value in raw) or 1.0
+    scale = min(1.0, max(0.0, volume)) * 32767.0 * 0.92 / peak
+    return _wav_bytes([int(value * scale) for value in raw], sample_rate)
+
+
+def script_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+class ClickSound:
+    """点击音效：优先用脚本同目录的 WAV 文件，没有就现场合成并写出来。
+
+    为什么要落一个文件：
+      · 文件在的话启动时直接跳过合成（省掉那 6~7ms）；
+      · 播文件可以用真正的 SND_ASYNC（CPython 不允许「异步 + 内存」），
+        点击回调立刻返回，不用为每次点击开一个线程；
+      · 想换成自己的声音，直接把这个 wav 替换掉就行。
+    目录不可写、没有 winsound 时自动退回「内存合成 + 后台线程播放」。
+    """
+
+    def __init__(
+        self,
+        enabled: bool = CLICK_SOUND,
+        volume: float = CLICK_SOUND_VOLUME,
+        filename: str = CLICK_SOUND_FILE,
+    ) -> None:
+        self.enabled = enabled
+        self.volume = volume
+        self.path = os.path.join(script_dir(), filename) if filename else ""
+        self._wav: bytes | None = None      # 兜底：文件不可用时就内存播放
+        self._ready = False
+
+    @staticmethod
+    def _looks_like_wav(path: str) -> bool:
+        """存在、是 RIFF/WAVE、且带数据块，就当作可用（也允许用户自己换一个）。"""
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) <= 44:
+                return False
+            with open(path, "rb") as handle:
+                head = handle.read(12)
+            return head[:4] == b"RIFF" and head[8:12] == b"WAVE"
+        except OSError:
+            return False
+
+    def _write_cache(self, data: bytes) -> None:
+        """先写临时文件再改名：避免生成到一半被中断留下坏文件。"""
+        temp = self.path + ".tmp"
+        with open(temp, "wb") as handle:
+            handle.write(data)
+        os.replace(temp, self.path)
+
+    def prepare(self) -> None:
+        """启动时调用：有缓存文件就直接用，没有才合成并写出来。"""
+        if self._ready or winsound is None:
+            return
+        self._ready = True
+        try:
+            if self.path and not self._looks_like_wav(self.path):
+                try:
+                    self._write_cache(build_mokugyo_wav(self.volume))
+                except OSError:
+                    self.path = ""          # 目录只读之类：退回内存播放
+            if not self.path:
+                self._wav = build_mokugyo_wav(self.volume)
+        except Exception:  # noqa: BLE001 - 合成失败就当没有音效
+            self.enabled = False
+
+    def play(self) -> None:
+        if not self.enabled or winsound is None:
+            return
+        if not self._ready:
+            self.prepare()
+        if not self.enabled:
+            return
+        try:
+            if self.path:
+                # 文件播放可以真异步：立即返回，不占线程、不卡界面
+                winsound.PlaySound(
+                    self.path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT
+                )
+            elif self._wav is not None:
+                # 内存在 CPython 里只能同步播，丢到后台线程去
+                threading.Thread(target=self._play_blocking, daemon=True).start()
+        except Exception:  # noqa: BLE001 - 没声卡/播放失败也不该影响刷新
+            self.enabled = False
+
+    def _play_blocking(self) -> None:
+        try:
+            winsound.PlaySound(self._wav, winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+        except Exception:  # noqa: BLE001
+            self.enabled = False
+
+
 class BalanceCube:
     def __init__(self, demo: bool = False, self_test: float = 0.0) -> None:
         self.demo = demo
@@ -422,10 +567,14 @@ class BalanceCube:
         self._sprites: dict[int, tk.PhotoImage] = {}   # 底图按缩放档位缓存
         self._sprite_signature: tuple[Any, ...] | None = None
         self._sprite_ok = True                          # Tk 不支持 PNG 时退回矢量绘制
+        self.topmost = bool(ALWAYS_ON_TOP)
+        self.sound = ClickSound()
         self._press: tuple[int, int, int, int] | None = None   # x_root,y_root,win_x,win_y
         self._dragged = False
 
         self._bind()
+        # 木鱼波形放后台线程先算好，第一次点击不用等
+        threading.Thread(target=self.sound.prepare, daemon=True).start()
         # 首帧延后到事件循环里：__init__ 期间 tk scaling 尚未稳定，
         # 而且窗口未映射时 winfo_* 还不可用。
         self.root.after(0, self._redraw)
@@ -680,14 +829,28 @@ class BalanceCube:
         self.canvas.bind("<Button-3>", self._on_menu)
         self.root.bind("<Escape>", lambda _event: self._quit())
         self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="刷新", command=self.refresh)
-        self.menu.add_command(label="置顶", command=self._toggle_top)
+        self.menu.add_command(label="刷新", command=self._menu_refresh)
+        self._top_var = tk.BooleanVar(master=self.root, value=self.topmost)
+        self.menu.add_checkbutton(label="置顶", variable=self._top_var, command=self._toggle_top)
+        self._sound_var = tk.BooleanVar(master=self.root, value=self.sound.enabled)
+        self.menu.add_checkbutton(label="点击音效", variable=self._sound_var, command=self._toggle_sound)
         self.menu.add_separator()
         self.menu.add_command(label="退出", command=self._quit)
 
     def _toggle_top(self) -> None:
-        self.topmost = not getattr(self, "topmost", True)
+        """菜单里的「置顶」：勾选 = 置顶，取消 = 不置顶。"""
+        self.topmost = bool(self._top_var.get())
         self.root.attributes("-topmost", self.topmost)
+
+    def _menu_refresh(self) -> None:
+        """右键菜单里的刷新：也敲一记木鱼。"""
+        self.sound.play()
+        self.refresh()
+
+    def _toggle_sound(self) -> None:
+        self.sound.enabled = bool(self._sound_var.get())
+        if self.sound.enabled:
+            self.sound.play()        # 重新打开时立刻响一声，方便确认
 
     def _on_press(self, event: tk.Event) -> None:
         self._press = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
@@ -705,6 +868,7 @@ class BalanceCube:
 
     def _on_release(self, _event: tk.Event) -> None:
         if not self._dragged:
+            self.sound.play()        # 木鱼「笃」
             self._bounce()   # 先 Q 弹，再刷新
             self.root.after(90, self.refresh)
         self._press = None
