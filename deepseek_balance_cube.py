@@ -589,6 +589,13 @@ def build_mokugyo_wav(volume: float = CLICK_SOUND_VOLUME) -> bytes:
 
 
 def script_dir() -> str:
+    """脚本所在的目录。
+
+    打包成 exe 之后 __file__ 指向的是临时解包目录（用完就删），所以冻结
+    状态下要改用 exe 自己的位置，音效缓存才会落在 exe 旁边。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
 
@@ -1144,56 +1151,102 @@ def math_exp_decay(progress: float) -> float:
     return math.exp(-4.2 * progress) * math.cos(11.0 * progress)
 
 
+def emit(text: str) -> None:
+    """尽量把文字写到控制台。
+
+    打包成窗口程序（pythonw）时没有控制台，stdout 可能为 None，也可能是句柄
+    已经失效的对象，直接 print 有可能抛异常。这里统一吞掉，绝不让写日志
+    这种小事把程序搞崩。
+    """
+    if sys.stdout is None:
+        return
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def show_report(title: str, lines: list[str]) -> None:
+    """把一段文字报给用户：有控制台就打出来，没有（打包成窗口程序）就弹对话框。"""
+    text = "\n".join(lines)
+    if sys.stdout is not None:
+        try:
+            sys.stdout.write(text + "\n")
+            sys.stdout.flush()
+            return
+        except Exception:  # noqa: BLE001 - 句柄无效，落到下面弹窗
+            pass
+    try:
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        messagebox.showinfo(title, text, parent=root)
+        root.destroy()
+    except Exception:  # noqa: BLE001 - 弹不出来也不能崩
+        pass
+
+
 def check_api_key() -> int:
     """命令行排查：Key 从哪儿来、长什么样、接口到底怎么回。
 
     对应命令：python deepseek_balance_cube.py --check-key
     0 = 一切正常，1 = 请求失败，2 = 根本没找到 Key。
+    打包成窗口程序（pythonw）时没有控制台，结果会弹对话框显示。
     """
     raw = os.environ.get(API_KEY_ENV) or ""
     key = resolve_api_key()
-    print(f"Key 来源：{key_source()}")
+    lines = [f"Key 来源：{key_source()}"]
 
     if not key:
-        print()
-        print("没有读到 Key。两种给 Key 的方式（二选一）：")
-        print(f'  1) 打开脚本，把配置区的 API_KEY = "" 改成 API_KEY = "sk-你的key"')
-        print(f"  2) 设一个临时的环境变量 {API_KEY_ENV}，然后「在同一个窗口里」启动脚本：")
-        print(f'       PowerShell :  $env:{API_KEY_ENV} = "sk-你的key"')
-        print(f"       cmd        :  set {API_KEY_ENV}=sk-你的key")
-        print(f"       Git Bash   :  export {API_KEY_ENV}=sk-你的key")
-        print()
-        print("两个最容易踩的坑：")
-        print(f"  · PowerShell 里的 set 不是 cmd 的 set：`set {API_KEY_ENV}=xxx` 不会设置")
-        print("    环境变量，只是建了个名字里带等号的 PowerShell 变量，所以 $env: 里还是空的。")
-        print("  · 临时变量只活在这个窗口里：双击图标、换个窗口、从编辑器启动都读不到；")
-        print("    脚本已经在跑的话，设完要关掉重开。想双击就能用，请走方式 1。")
+        lines += [
+            "",
+            "没有读到 Key。两种给 Key 的方式（二选一）：",
+            '  1) 把脚本/配置里的 API_KEY = "" 改成 API_KEY = "sk-你的key"',
+            f"  2) 设一个临时的环境变量 {API_KEY_ENV}，然后「在同一个窗口里」启动：",
+            f'       PowerShell :  $env:{API_KEY_ENV} = "sk-你的key"',
+            f"       cmd        :  set {API_KEY_ENV}=sk-你的key",
+            f"       Git Bash   :  export {API_KEY_ENV}=sk-你的key",
+            "",
+            "两个最容易踩的坑：",
+            "  · PowerShell 里的 set 不是 cmd 的 set：`set 变量=值` 不会设置环境变量，",
+            "    只是建了个名字里带等号的 PowerShell 变量，$env: 里还是空的。",
+            "  · 临时变量只活在那个窗口里：双击图标、换窗口、从编辑器启动都读不到。",
+            "    想双击 exe 就能用，请走方式 1（或打包时用 --onefile 出来的 exe 也一样）。",
+        ]
+        show_report("DeepSeek 余额 · Key 检查", lines)
         return 2
 
-    print(f"Key 掩码：{mask_key(key)}    长度：{len(key)}")
-    if raw.strip()[:1] in "\"'" or raw.strip()[-1:] in "\"'":
-        print("提醒：环境变量里的值带了引号，脚本已自动去掉；建议重新设置成不带引号的值。")
+    lines.append(f"Key 掩码：{mask_key(key)}    长度：{len(key)}")
+    if raw and clean_key(raw) != raw:
+        lines.append("提醒：环境变量的值首尾多了空白或引号，脚本已自动清理；建议重设成干净的值。")
     if not key.startswith("sk-"):
-        print("提醒：DeepSeek 的 Key 一般以 sk- 开头，这个看着不太像。")
+        lines.append("提醒：DeepSeek 的 Key 一般以 sk- 开头，这个看着不太像。")
 
-    print(f"正在请求 {API_URL} …")
+    lines.append(f"正在请求 {API_URL} …")
     try:
         payload = fetch_balance(key)
     except RuntimeError as error:
-        print(f"结果：失败 —— {error}")
-        print()
-        print("对号入座：")
-        print("  · Key 无效 / 401        → Key 抄错了、带引号了，或者已经被删掉")
-        print("  · 余额不足 402          → 账户欠费，去官网充值")
-        print("  · 网络不可达            → 断网、需要代理/VPN，或防火墙拦了 api.deepseek.com")
-        print("  · 请求过频 429          → 等一下再试")
+        lines += [
+            f"结果：失败 —— {error}",
+            "",
+            "对号入座：",
+            "  · Key 无效 / 401        → Key 抄错了、带引号了，或者已经被删掉",
+            "  · 余额不足 402          → 账户欠费，去官网充值",
+            "  · 网络不可达            → 断网、需要代理/VPN，或防火墙拦了 api.deepseek.com",
+            "  · 请求过频 429          → 等一下再试",
+        ]
+        show_report("DeepSeek 余额 · Key 检查", lines)
         return 1
 
     currency = ""
     infos = payload.get("balance_infos") or []
     if infos:
         currency = str(infos[0].get("currency", ""))
-    print(f"结果：成功，余额 {first_balance(payload)} {currency}")
+    lines.append(f"结果：成功，余额 {first_balance(payload)} {currency}")
+    show_report("DeepSeek 余额 · Key 检查", lines)
     return 0
 
 
@@ -1208,11 +1261,10 @@ def main() -> None:
     if args.check_key:
         sys.exit(check_api_key())
     if not args.demo and not resolve_api_key():
-        print(
+        emit(
             "没找到 DeepSeek API Key：可以填脚本配置区的 API_KEY，"
             f"或设置环境变量 {API_KEY_ENV}；"
-            "详细排查请运行: python deepseek_balance_cube.py --check-key",
-            file=sys.stderr,
+            "详细排查请运行: python deepseek_balance_cube.py --check-key"
         )
     try:
         BalanceCube(demo=args.demo, self_test=args.self_test).run()
