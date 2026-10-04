@@ -2,3 +2,6 @@ __pycache__/*
 *.wav
 *.exe
 *.ico
+
+# CMake 构建目录
+build/

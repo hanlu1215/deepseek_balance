@@ -3,17 +3,187 @@
 一个常驻桌面角落的小悬浮窗，只显示两样东西：**账户余额** 和 **峰 / 谷计费时段的倒计时**。
 左键点一下敲声木鱼顺便刷新，拖一下换位置，右键菜单里能置顶、关音效、关颜色轮换。
 
-- **大圆角卡片**：底图逐行渲染成抗锯齿 PNG，边缘不毛糙，文字占满卡片几乎没有留白
+**同一个功能有两份独立实现，按需要挑一份用：**
+
+| | **C/C++ 版** | **Python 版** |
+| --- | --- | --- |
+| 运行前提 | 无，一个 exe 双击就跑 | 要装 Python 3.10+ |
+| 产物 | 单个 exe（约 950 KB） | 一个 `.py` 脚本 |
+| 第三方依赖 | 无（MinGW 自动静态链接） | 无（只用标准库） |
+| 运行期写文件 | **一个都不写** | 首次运行生成音效缓存 `mokugyo_click.wav` |
+| 卡片边缘 | 逐像素半透明，深色背景不留杂边 | 透明色抠图 |
+| 适合 | 拷去别的电脑、给别人用 | 想改代码、快速试效果 |
+
+两份实现的功能、交互、界面布局和命令行参数保持一致，配置项的字段名也基本一一对应。
+
+功能一览（两份都有）：
+
+- **大圆角卡片**：抗锯齿渲染，边缘不毛糙，文字占满卡片几乎没有留白
 - **峰 / 谷 徽标 + `时:分:秒` 倒计时**：自动跳过周末和法定节假日
 - **点击木鱼音效**：波形由代码现场合成，仓库里不需要任何音频素材文件
 - **余额数字每次刷新换一种颜色**：金 → 橘 → 红 → 蓝 → 青 → 白（可关）
 - **自适应刷新节奏**：平时 5 分钟看一眼，余额掉得快就自动加密（最快 30 秒），余额不动再慢慢放回 5 分钟，并带随机抖动
-- **零第三方依赖**：只用 Python 标准库（tkinter + winsound），连 `pip install` 都不需要
-- **可以打包成单文件 exe**：别人拿到双击就能跑，不用装 Python（见「打包成 exe」）
+- **零第三方依赖**，**可以编译/打包成单个 exe**：别人拿到双击就能跑
 
 ---
 
-## 1. 系统要求
+## C/C++ 版（Win32 + GDI+ + CMake）
+
+编译出来是**孤零零一个 exe**：图标在编译时嵌进资源，木鱼波形在启动时由代码现场合成、只放在
+内存里。拷到任何一台 Windows 10/11 上双击就能跑，**运行期间不会在磁盘上创建或修改任何文件**。
+
+运行期只依赖这些**系统自带**的 DLL，目标机器什么都不用装：
+
+```
+KERNEL32 / USER32 / GDI32 / SHELL32 / WINMM / WINHTTP / gdiplus
+api-ms-win-crt-*        ← 通用 C 运行时（UCRT），Windows 10 起随系统提供
+```
+
+> MinGW 编出来的程序默认依赖 `libgcc_s_seh-1.dll` / `libstdc++-6.dll`，拷到没装 MSYS2 的
+> 机器上就起不来。本项目的 `CMakeLists.txt` 已经自动静态链接
+> （`-static -static-libgcc -static-libstdc++`），代价是 exe 从约 350 KB 涨到约 950 KB。
+>
+> UCRT 那一组要注意：Windows 10 / 11 天然就有；目标机器若是 Windows 7/8，
+> 需要先打微软的 KB2999226（Universal C Runtime 更新）。
+
+### 文件结构
+
+| 文件 | 作用 |
+| --- | --- |
+| `CMakeLists.txt` | 构建脚本（图标、清单、静态链接都在这里配） |
+| `src/config.h` | **配置区**：API Key、刷新节奏、配色、尺寸、音效开关 |
+| `src/main.cpp` | 入口、命令行参数、`--check-key` |
+| `src/cube.{h,cpp}` | 窗口、鼠标交互、状态机、卡片绘制 |
+| `src/render.{h,cpp}` | GDI+ 抗锯齿渲染（分层窗口 + 逐像素 alpha） |
+| `src/balance.{h,cpp}` | WinHTTP 请求、Key 解析、错误归类 |
+| `src/peak.{h,cpp}` | 峰 / 谷判定、法定节假日、倒计时 |
+| `src/pacer.{h,cpp}` | 自适应刷新节奏 |
+| `src/sound.{h,cpp}` | 木鱼波形合成 + 播放 |
+| `src/json.{h,cpp}` | 极简 JSON 解析（零依赖） |
+| `src/util.{h,cpp}` | UTF-8 / UTF-16 转换等杂项 |
+| `src/resources/` | 应用清单（DPI 感知 + 现代控件样式）和资源脚本模板 |
+
+### 环境要求
+
+| 项目 | 要求 |
+| --- | --- |
+| 系统 | **Windows 10 / 11** |
+| CMake | 3.16 或更高 |
+| 编译器 | MSVC（VS 2019+）**或** MinGW-w64（MSYS2 UCRT64 验证通过） |
+
+### 编译
+
+```powershell
+# 在项目根目录
+cmake -S . -B build
+cmake --build build --config Release
+```
+
+产物在 **`build/bin/deepseek_balance_cube.exe`**。
+
+- Visual Studio 这类多配置生成器要带 `--config Release`；
+- Ninja / MinGW Makefiles 单配置生成器可以省略。
+
+### 图标
+
+exe 图标取项目根目录的 **`ks.ico`**，同时用作窗口图标。
+
+> 仓库的 `.gitignore` 里有 `*.ico`，这个文件是用 `git add -f ks.ico` 强制加进来的。
+> 以后换图标时记得同样强制添加，否则改了也不会进版本库。
+> 若 `ks.ico` 缺失，构建**只警告、不报错**，只是 exe 用系统默认图标。
+
+### 运行
+
+```powershell
+.\build\bin\deepseek_balance_cube.exe              # 正常启动
+.\build\bin\deepseek_balance_cube.exe --demo       # 用假数据渲染，不联网
+.\build\bin\deepseek_balance_cube.exe --check-key  # 只查 Key 和网络，不开窗口
+.\build\bin\deepseek_balance_cube.exe -h           # 帮助
+```
+
+命令行参数和 Python 版完全一致（`--demo` / `--self-test 秒` / `--check-key` / `-h`）。
+在 cmd 或 PowerShell 里跑 `--check-key` 会把结果打到控制台；双击运行时没有控制台，则自动弹对话框。
+
+### 配置 API Key
+
+改 `src/config.h` 里的这一行，然后**重新编译**（Key 是编进 exe 的）：
+
+```cpp
+inline constexpr const wchar_t* kApiKeyLiteral = L"sk-你的key";
+```
+
+两个容易踩的点：**要带 `L` 前缀**（这里要的是宽字符串，写成 `"sk-xxx"` 编不过）；
+**改完必须重新编译**，改文件不会影响已经编好的 exe。
+
+留空则回退到环境变量 `DEEPSEEK_API_KEY`（变量名可以在 `kApiKeyEnv` 改）：
+
+```powershell
+$env:DEEPSEEK_API_KEY = "sk-你的key"     # PowerShell
+set DEEPSEEK_API_KEY=sk-你的key          # cmd
+export DEEPSEEK_API_KEY=sk-你的key       # Git Bash
+.\build\bin\deepseek_balance_cube.exe    # 必须在同一个窗口里启动
+```
+
+> ⚠️ **Key 一旦编进 exe，就是明文可见的。** 字符串字面量会原样躺在 PE 的 `.rdata` 段里，
+> 任何人拿到 exe，用十六进制编辑器或者几行脚本就能捞出来。`--check-key` 显示的是掩码，
+> 但那只是显示层的处理，**不代表二进制里也是掩码** —— 混淆、异或、分段拼接都只是提高门槛，
+> 用调试器照样能在内存里抓到。
+>
+> 所以：只在自己机器上用没问题；**这个 exe 别发给别人**。要发给别人，就让 `kApiKeyLiteral`
+> 留空，让对方各自设自己的环境变量。
+
+### 改外观 / 改行为
+
+全在 `src/config.h`，改完重新编译：
+
+| 想改什么 | 改哪个 |
+| --- | --- |
+| 卡片大小、圆角、四周留白 | `kCardWidth` `kCardHeight` `kCornerRadius` `kOuterMargin` |
+| 字号、两行文字的间距 | `kAmountFontPx` `kPillFontPx` `kAmountCenterY` `kPillCenterY` |
+| Q 弹的幅度和时长 | `kBounceAmplitude` `kBounceDuration` |
+| 音效开关、音量、长度 | `kClickSound` `kClickSoundVolume` `kClickSoundSeconds` |
+| 刷新节奏 | `kBalanceRefreshSeconds`（0=自适应，正数=固定秒数，负数=关掉自动刷新） |
+| 自适应节奏的上下限 | `kRefreshMinSeconds` `kRefreshMaxSeconds` |
+| 颜色轮换 | `kAmountColorCycle` `kAmountColorList` |
+| 配色 | `kColorTopArgb` `kColorBottomArgb` `kColorPeakArgb` … 都是 `0xAARRGGBB` |
+| 窗口位置、是否置顶 | `kStartAt` `kAlwaysOnTop` `kScreenMargin` |
+| 界面字体 | `kFontFamily`（取不到会自动回退） |
+
+想换成自己的点击音效：把一个 `mokugyo_click.wav` 放到 exe 同目录即可，程序**只读不写**；
+没有这个文件就用内置合成的那记「笃」。
+
+### 常见问题（C++ 版）
+
+**链接时报 `ld returned 5`，没有别的信息**
+上一次运行的 exe 还没完全退出、文件被占用。等一两秒重试，或
+`taskkill /F /IM deepseek_balance_cube.exe`。杀毒软件刚扫过新生成的 exe 时也可能短暂占用。
+
+**配置时提示找不到 `ks.ico`**
+构建**不会失败**，只是 exe 没有自定义图标。把 `ks.ico` 放回项目根目录即可（见上面「图标」）。
+
+**拷到别的电脑上双击没反应 / 报缺 DLL**
+先确认那台机器是 Windows 10 或更高。老系统缺 UCRT，需要装 KB2999226。
+
+**方块里显示红字「缺 Key」**
+`kApiKeyLiteral` 是空的，且环境变量没设。跑 `deepseek_balance_cube.exe --check-key`
+看它到底从哪儿读的、掩码长什么样。
+
+（「Key 无效」「网络不可达」「点击没声音」等界面表现与 Python 版一致，见下面 Python 版的常见问题。）
+
+### 和 Python 版的实现差异
+
+- **卡片边缘**：Python 版用「透明色抠图」，圆角外侧靠色键挖空；C++ 版用 `UpdateLayeredWindow`
+  配 32 位预乘 alpha，圆角是真正的逐像素半透明，深色背景上不会留一圈杂边。
+- **渲染方式**：Python 版把底图逐行渲染成 PNG 再缓存；C++ 版每帧直接重画（卡片只有
+  172×136 像素，重画的开销可以忽略），不再需要按缩放档位缓存底图。
+- **音效**：Python 版首次运行会在脚本目录生成 `mokugyo_click.wav` 缓存；C++ 版全程在内存里
+  合成，不落盘。
+
+---
+
+## Python 版（tkinter + winsound）
+
+### 1. 系统要求
 
 | 项目 | 要求 |
 | --- | --- |
@@ -25,7 +195,7 @@
 
 ---
 
-## 2. 快速开始
+### 2. 快速开始
 
 ```powershell
 # 1. 拿到代码（clone 或直接下载 zip 解压）
@@ -42,9 +212,9 @@ python deepseek_balance_cube.py
 
 ---
 
-## 3. 配置 API Key
+### 3. 配置 API Key
 
-### 方式一：写进脚本（最省事，适合自己用）
+#### 方式一：写进脚本（最省事，适合自己用）
 
 打开 `deepseek_balance_cube.py`，找到文件开头的配置区：
 
@@ -55,7 +225,7 @@ API_KEY_ENV = "DEEPSEEK_API_KEY"
 
 改成 `API_KEY = "sk-你的key"` 保存即可。
 
-### 方式二：用临时环境变量（不改文件，推荐给开源仓库/多人共用）
+#### 方式二：用临时环境变量（不改文件，推荐给开源仓库/多人共用）
 
 在命令行窗口里先设变量，**然后在同一个窗口里启动脚本**：
 
@@ -83,9 +253,9 @@ python deepseek_balance_cube.py
 
 ---
 
-## 4. 启动方式
+### 4. 启动方式
 
-### 4.1 带命令行窗口（调试用）
+#### 4.1 带命令行窗口（调试用）
 
 ```powershell
 python deepseek_balance_cube.py
@@ -93,7 +263,7 @@ python deepseek_balance_cube.py
 
 好处是出错信息、排查输出都能看到。
 
-### 4.2 用 pythonw.exe 启动（没有黑色窗口）
+#### 4.2 用 pythonw.exe 启动（没有黑色窗口）
 
 `python.exe` 会带一个控制台窗口，`pythonw.exe` 完全没有窗口，适合日常挂着。
 
@@ -122,9 +292,9 @@ start "" "C:\Python314\pythonw.exe" "D:\你的目录\deepseek_balance\deepseek_b
 
 ---
 
-## 5. 创建快捷方式（含参数怎么填）
+### 5. 创建快捷方式（含参数怎么填）
 
-### 做法 A：手动新建
+#### 做法 A：手动新建
 
 1. 桌面空白处右键 → **新建** → **快捷方式**
 2. 「请键入对象的位置」填（第一段是 pythonw.exe，第二段是脚本，都加英文双引号）：
@@ -144,7 +314,7 @@ start "" "C:\Python314\pythonw.exe" "D:\你的目录\deepseek_balance\deepseek_b
 | **快捷键(K)** | 可选，比如 `Ctrl+Alt+B` |
 | **更改图标(C)** | 可选，选 `pythonw.exe`，或你自己的 `.ico` |
 
-### 做法 B：从脚本直接生成（更快）
+#### 做法 B：从脚本直接生成（更快）
 
 1. 右键脚本 → **显示更多选项** → **发送到** → **桌面快捷方式**
 2. 右键生成的快捷方式 → 属性 → 把「目标」改成上面那种 pythonw 开头的写法
@@ -161,11 +331,11 @@ start "" "C:\Python314\pythonw.exe" "D:\你的目录\deepseek_balance\deepseek_b
 
 ---
 
-## 6. 打包成独立 exe（可选）
+### 6. 打包成独立 exe（可选）
 
 想要**一个能拷给别人的单文件程序**（对方不用装 Python），用 PyInstaller 打包。下面这套流程跟具体的 Python 安装位置无关，照着做就行。
 
-### 6.1 前置条件
+#### 6.1 前置条件
 
 - 脚本本身能正常跑起来：`python deepseek_balance_cube.py`
 - 安装 PyInstaller（只是打包工具，不是运行依赖）：
@@ -184,7 +354,7 @@ python -m pip install --upgrade pyinstaller
 >
 > 如果 pip 说要**现场编译 bootloader**（某些非官方 Python 发行版会这样，比如 MSYS2 的 Python），那本机需要有 C 编译器；用 [python.org](https://www.python.org/downloads/windows/) 的官方安装包可以直接装现成的 wheel，省事。
 
-### 6.2 基础打包命令
+#### 6.2 基础打包命令
 
 在项目目录下执行：
 
@@ -204,7 +374,7 @@ python -m PyInstaller --noconfirm --clean --onefile --noconsole --name DeepSeekB
 | `--clean` | 先清掉上次的构建缓存，避免改了代码还打旧包 |
 | `--noconfirm` | 覆盖已有产物时不再询问 |
 
-### 6.3 加图标（可选）
+#### 6.3 加图标（可选）
 
 ```powershell
 python -m PyInstaller --noconfirm --clean --onefile --noconsole --name DeepSeekBalance --icon app.ico deepseek_balance_cube.py
@@ -219,14 +389,14 @@ Image.open("icon.png").save("app.ico", sizes=[(16, 16), (24, 24), (32, 32), (48,
 
 打包完成后，在资源管理器里把查看方式切成「大图标」就能看到 exe 的实际图标；如果还是旧图标，那是 Windows 的图标缓存（重命名一下或用工具刷新缓存即可）。
 
-### 6.4 验证打包结果
+#### 6.4 验证打包结果
 
 1. 双击 `dist\DeepSeekBalance.exe`：窗口应该正常出现，**不弹黑色命令行窗口**；
 2. 首次运行后，exe 旁边会**自动生成 `mokugyo_click.wav`**（木鱼音效的缓存，脚本版则生成在脚本旁边）；如果 exe 放在不能写的目录（比如 `C:\Program Files`），会自动退回内存合成播放，不影响使用；
 3. exe 里的代码是**打包那一刻的副本**，改了脚本必须重新打包；
 4. 想排查 Key / 网络问题时，exe 没有控制台，`--check-key` 会**弹对话框**显示结果（脚本版则直接打印在命令行里）。
 
-### 6.5 打包常见问题
+#### 6.5 打包常见问题
 
 | 现象 | 原因 / 处理方法 |
 | --- | --- |
@@ -238,7 +408,7 @@ Image.open("icon.png").save("app.ico", sizes=[(16, 16), (24, 24), (32, 32), (48,
 | 打包体积偏大 | 在干净的 venv 里打包；或用 `--exclude-module` 排掉用不到的库 |
 | 中文路径 / 中文 exe 名 | 一般没问题，出问题就先把产物换成英文名试试 |
 
-### 6.6 开源仓库里要注意的两件事
+#### 6.6 开源仓库里要注意的两件事
 
 1. **别把 API Key 打进发行版**：Key 会随脚本一起进 exe。它不是明文躺在文件里（打包后是压缩过的字节码），但用现成的解包工具能提取出来，所以发布前确认 `API_KEY` 是空的，让使用者自己填或用环境变量。同理，别把带 Key 的 exe 传到网上。
 2. **别把构建产物提交进版本库**：`.gitignore` 建议加上
@@ -258,7 +428,7 @@ mokugyo_click.wav
 
 ---
 
-## 7. 交互与菜单
+### 7. 交互与菜单
 
 | 操作 | 效果 |
 | --- | --- |
@@ -279,7 +449,7 @@ mokugyo_click.wav
 
 ---
 
-## 8. 命令行参数
+### 8. 命令行参数
 
 | 参数 | 作用 |
 | --- | --- |
@@ -305,7 +475,7 @@ Key 掩码：sk-a**********90    长度：35
 
 ---
 
-## 9. 刷新节奏（自适应）
+### 9. 刷新节奏（自适应）
 
 默认不按固定间隔刷，而是**跟着花钱速度走**：
 
@@ -328,7 +498,7 @@ Key 掩码：sk-a**********90    长度：35
 
 ---
 
-## 10. 外观与音效配置
+### 10. 外观与音效配置
 
 都在脚本开头的配置区，改完重启生效：
 
@@ -353,7 +523,7 @@ Key 掩码：sk-a**********90    长度：35
 
 ---
 
-## 11. 常见问题
+### 11. 常见问题
 
 **方块里显示红字「缺 Key」**
 没读到 Key。跑 `python deepseek_balance_cube.py --check-key`，或按第 3 节配置。
@@ -384,29 +554,40 @@ Key 抄错了、过期了，或者值里混进了引号/空格。用 `--check-ke
 
 ---
 
-## 12. 文件说明
+### 12. 文件说明
 
 | 文件 | 说明 |
 | --- | --- |
-| `deepseek_balance_cube.py` | 主脚本，唯一必需的文件 |
+| `deepseek_balance_cube.py` | Python 版主脚本，唯一必需的文件 |
+| `src/`、`CMakeLists.txt` | C/C++ 版全部源码与构建脚本（见上面「C/C++ 版」的文件结构表） |
+| `ks.ico` | exe / 窗口图标（用 `git add -f` 强制加进来的，因为 `.gitignore` 排除了 `*.ico`） |
 | `README.md` | 本说明 |
-| `mokugyo_click.wav` | 首次运行自动生成的音效缓存，可删、可替换 |
-| `*.ico` | 可选，打包 exe 时用 `--icon` 指定的图标 |
-| `__pycache__/`、`build/`、`dist/`、`*.spec` | 运行/打包产生的缓存与产物，都可以删，建议写进 `.gitignore` |
+| `mokugyo_click.wav` | **Python 版**首次运行自动生成的音效缓存，可删、可替换（C++ 版不写这个文件） |
+| `__pycache__/`、`build/`、`dist/`、`*.spec` | 运行/构建/打包产生的缓存与产物，都可以删，已在 `.gitignore` 里 |
 
 ---
 
-## 13. 反馈与贡献
+### 13. 反馈与贡献
 
 欢迎提 Issue 和 PR。改代码前建议先自查两件事：
 
 ```powershell
+# Python 版
 python deepseek_balance_cube.py --demo --self-test 5   # 看外观有没有画歪
 python deepseek_balance_cube.py --check-key            # 看接口链路通不通
+
+# C/C++ 版
+.\build\bin\deepseek_balance_cube.exe --demo --self-test 5
+.\build\bin\deepseek_balance_cube.exe --check-key
 ```
+
+改 `src/` 里任何跟排版、字号、动画有关的代码后，记得**两边都跑一遍对照**：
+两份实现的版式是要求一致的，别只看一边。两个已知的 GDI+ 坑写在
+`src/render.cpp` 的注释里（默认 `StringFormat` 会加 1/6 em 左留白；垂直居中要用
+Tk 的 ascent+descent 模型而不是 GDI+ 含行距的行盒）。
 
 ---
 
-## 14. 许可证
+### 14. 许可证
 
 见仓库根目录的 `LICENSE` 文件。
