@@ -3,31 +3,33 @@
 一个常驻桌面角落的小悬浮窗，只显示两样东西：**账户余额** 和 **峰 / 谷计费时段的倒计时**。
 左键点一下敲声木鱼顺便刷新，拖一下换位置，右键菜单里能置顶、关音效、关颜色轮换。
 
-**同一个功能有两份独立实现，按需要挑一份用：**
+**同一个功能有三份独立实现，按平台和需要挑一份用：**
 
-| | **C/C++ 版** | **Python 版** |
-| --- | --- | --- |
-| 运行前提 | 无，一个 exe 双击就跑 | 要装 Python 3.10+ |
-| 产物 | 单个 exe（约 950 KB） | 一个 `.py` 脚本 |
-| 第三方依赖 | 无（MinGW 自动静态链接） | 无（只用标准库） |
-| 运行期写文件 | **一个都不写** | 首次运行生成音效缓存 `mokugyo_click.wav` |
-| 卡片边缘 | 逐像素半透明，深色背景不留杂边 | 透明色抠图 |
-| 适合 | 拷去别的电脑、给别人用 | 想改代码、快速试效果 |
+| | **C/C++ 版 · Windows** | **C/C++ 版 · Linux** | **Python 版** |
+| --- | --- | --- | --- |
+| 位置 | 根目录 `src/` | [`linux/`](linux/) | `deepseek_balance_cube.py` |
+| 图形栈 | Win32 + GDI+ | GTK3 + cairo + Pango | tkinter |
+| 运行前提 | 无，一个 exe 双击就跑 | GTK3 等系统库（桌面发行版基本自带） | 要装 Python 3.10+ |
+| 产物 | 单个 exe（约 950 KB） | 可执行文件，依赖系统库 | 一个 `.py` 脚本 |
+| 第三方依赖 | 无（MinGW 自动静态链接） | GTK3 / cairo / Pango / GIO | 无（只用标准库） |
+| 运行期写文件 | **一个都不写** | **一个都不写** | 首次运行生成音效缓存 `mokugyo_click.wav` |
+| 卡片边缘 | 逐像素半透明，深色背景不留杂边 | 逐像素半透明（同左） | 透明色抠图 |
+| 适合 | 拷去别的 Windows 用 | Linux 桌面日常用 | 想改代码、快速试效果 |
 
-两份实现的功能、交互、界面布局和命令行参数保持一致，配置项的字段名也基本一一对应。
+三份实现的功能、交互、界面布局和命令行参数保持一致，配置项的字段名也基本一一对应。
 
-功能一览（两份都有）：
+功能一览（三份都有）：
 
 - **大圆角卡片**：抗锯齿渲染，边缘不毛糙，文字占满卡片几乎没有留白
 - **峰 / 谷 徽标 + `时:分:秒` 倒计时**：自动跳过周末和法定节假日
 - **点击木鱼音效**：波形由代码现场合成，仓库里不需要任何音频素材文件
 - **余额数字每次刷新换一种颜色**：金 → 橘 → 红 → 蓝 → 青 → 白（可关）
 - **自适应刷新节奏**：平时 5 分钟看一眼，余额掉得快就自动加密（最快 30 秒），余额不动再慢慢放回 5 分钟，并带随机抖动
-- **零第三方依赖**，**可以编译/打包成单个 exe**：别人拿到双击就能跑
+- **零第三方依赖**：Windows 版还能静态链接成单个 exe，别人拿到双击就能跑
 
 ---
 
-## C/C++ 版（Win32 + GDI+ + CMake）
+## C/C++ 版 · Windows（Win32 + GDI+ + CMake）
 
 编译出来是**孤零零一个 exe**：图标在编译时嵌进资源，木鱼波形在启动时由代码现场合成、只放在
 内存里。拷到任何一台 Windows 10/11 上双击就能跑，**运行期间不会在磁盘上创建或修改任何文件**。
@@ -152,7 +154,7 @@ export DEEPSEEK_API_KEY=sk-你的key       # Git Bash
 想换成自己的点击音效：把一个 `mokugyo_click.wav` 放到 exe 同目录即可，程序**只读不写**；
 没有这个文件就用内置合成的那记「笃」。
 
-### 常见问题（C++ 版）
+### 常见问题（Windows 版）
 
 **链接时报 `ld returned 5`，没有别的信息**
 上一次运行的 exe 还没完全退出、文件被占用。等一两秒重试，或
@@ -168,16 +170,112 @@ export DEEPSEEK_API_KEY=sk-你的key       # Git Bash
 `kApiKeyLiteral` 是空的，且环境变量没设。跑 `deepseek_balance_cube.exe --check-key`
 看它到底从哪儿读的、掩码长什么样。
 
-（「Key 无效」「网络不可达」「点击没声音」等界面表现与 Python 版一致，见下面 Python 版的常见问题。）
+（「Key 无效」「网络不可达」「点击没声音」等界面表现与其它两版一致，见下面 Python 版的常见问题。）
 
 ### 和 Python 版的实现差异
 
-- **卡片边缘**：Python 版用「透明色抠图」，圆角外侧靠色键挖空；C++ 版用 `UpdateLayeredWindow`
-  配 32 位预乘 alpha，圆角是真正的逐像素半透明，深色背景上不会留一圈杂边。
-- **渲染方式**：Python 版把底图逐行渲染成 PNG 再缓存；C++ 版每帧直接重画（卡片只有
+- **卡片边缘**：Python 版用「透明色抠图」，圆角外侧靠色键挖空；Windows 版用
+  `UpdateLayeredWindow` 配 32 位预乘 alpha，圆角是真正的逐像素半透明，深色背景上不会留一圈杂边
+  （Linux 版用 cairo 同样拿到逐像素 alpha）。
+- **渲染方式**：Python 版把底图逐行渲染成 PNG 再缓存；两个 C++ 版都是每帧直接重画（卡片只有
   172×136 像素，重画的开销可以忽略），不再需要按缩放档位缓存底图。
-- **音效**：Python 版首次运行会在脚本目录生成 `mokugyo_click.wav` 缓存；C++ 版全程在内存里
+- **音效**：Python 版首次运行会在脚本目录生成 `mokugyo_click.wav` 缓存；两个 C++ 版全程在内存里
   合成，不落盘。
+
+---
+
+## C/C++ 版 · Linux（GTK3 + cairo）
+
+Windows 版的 Linux 移植，源码在 **[`linux/`](linux/)**，完整说明见 **[`linux/README.md`](linux/README.md)**。
+这份目录是**独立的**：自带 `CMakeLists.txt` 和全部源码，整个拷到别处照样能编，
+不读也不写仓库里的其它任何东西。
+
+### 依赖
+
+全是系统库，桌面发行版基本自带，只需要装开发文件：
+
+| 依赖 | 用途 | Ubuntu 包名 |
+| --- | --- | --- |
+| GTK3 ≥ 3.22 | 窗口、菜单、事件 | `libgtk-3-dev` |
+| cairo | 卡片绘制（逐像素半透明） | 随 GTK3 |
+| Pango | 文字排版与度量 | 随 GTK3 |
+| GIO + glib-networking | HTTPS 请求（TLS 由 `libgiognutls.so` 提供） | `libglib2.0-dev`、`glib-networking` |
+
+```bash
+sudo apt install build-essential cmake pkg-config libgtk-3-dev
+```
+
+运行期还需要一个命令行播放器放木鱼音效（`paplay` / `aplay` / `ffplay` 之一，见下面「音效」）。
+
+### 编译
+
+**必须在 `linux/` 目录里构建** —— 根目录的 `CMakeLists.txt` 是 Windows 专用的，
+在 Linux 上会直接 `FATAL_ERROR`（这是它本来的行为，没动过）：
+
+```bash
+cd linux
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"$(nproc)"
+```
+
+产物在 **`linux/build/bin/deepseek_balance_cube`**。
+
+### 运行
+
+下面都以「当前在 `linux/` 目录里」为前提：
+
+```bash
+./build/bin/deepseek_balance_cube              # 正常启动（自动转后台，不占终端）
+./build/bin/deepseek_balance_cube --demo       # 用假数据渲染，不联网
+./build/bin/deepseek_balance_cube --foreground # 留在前台跑（调试用，报错能直接看到）
+./build/bin/deepseek_balance_cube --check-key  # 只查 Key 和网络，不开窗口
+```
+
+启动后会自动 double-fork 转后台，终端立刻还给你。`--check-key` / `--render-png` / `--self-test`
+要往终端出结果，**不会**转后台。
+
+要停掉它：右键菜单 →「退出」，或点一下方块按 `Esc`，或
+
+```bash
+pkill -x deepseek_balanc    # 进程名被 Linux 截断到 15 字符，写全名反而匹配不上
+```
+
+### 配置 API Key
+
+和 Windows 版一样改 `src/config.h`（即 `linux/src/config.h`），但**类型不一样**：
+
+```cpp
+inline constexpr const char* kApiKeyLiteral = "sk-你的key";   // Linux 是窄字符串，不加 L 前缀
+```
+
+留空则回退到环境变量 `DEEPSEEK_API_KEY`。想长期生效就写进 `~/.bashrc` 或 `~/.profile`，
+但**别把 Key 提交进仓库**。`--check-key` 同样会打印 Key 来源、掩码、长度并发一次真实请求。
+
+### Linux 独有的调试选项
+
+不开窗口、不需要 `DISPLAY`，SSH 里也能跑，专门用来检查排版：
+
+```bash
+./build/bin/deepseek_balance_cube --demo --render-png /tmp/card.png
+./build/bin/deepseek_balance_cube --demo --render-png /tmp/h.png --render-png-at 1791200000
+./build/bin/deepseek_balance_cube --demo --render-png /tmp/c2.png --render-png-scale 2
+```
+
+### 几个平台决定的行为
+
+- **强制走 X11 后端（XWayland）**：原生 Wayland 下合成器不允许客户端自己定位窗口、也没有置顶
+  协议，「贴右上角 / 拖动移动 / 置顶」会全部失效。所以 `DISPLAY` 存在时会自动把 `GDK_BACKEND`
+  设成 `x11`；想强制原生 Wayland 就自己设 `GDK_BACKEND=wayland`。
+- **时区**：峰谷时段按北京时间硬编码，Linux 上机器时区可能是别的，所以启动时会把**进程**的
+  `TZ` 设成 `Asia/Shanghai`（只影响本进程，不动系统设置）。
+- **音效**：没有 WinMM，改成合成裸 PCM 通过管道喂给系统播放器（`paplay` → `aplay` → `ffplay`
+  按序探测），**全程不落盘**。一个都没装就静默禁用音效（右键菜单里那项置灰），其余功能不受影响。
+- **代理**：`http_proxy` / `https_proxy` / `all_proxy` 自动识别；不设则跟随系统代理设置。
+- **右键菜单是自定义弹窗**，没用 `GtkMenu` —— 在 Wayland + XWayland 下 `GtkMenu` 的指针抓取会
+  导致菜单项收不到 `activate`，属于 GTK 在这个组合下的老问题。顺带的好处是菜单能跟着卡片走深色配色。
+- **不做自包含单文件**：GTK3 依赖一堆系统库和运行期加载的 gio 模块，做不到也不该做。也没有托盘图标。
+
+排查（窗口黑底、点不动、没声音、菜单配色）见 **[`linux/README.md`](linux/README.md)**。
 
 ---
 
@@ -558,33 +656,47 @@ Key 抄错了、过期了，或者值里混进了引号/空格。用 `--check-ke
 
 | 文件 | 说明 |
 | --- | --- |
-| `deepseek_balance_cube.py` | Python 版主脚本，唯一必需的文件 |
-| `src/`、`CMakeLists.txt` | C/C++ 版全部源码与构建脚本（见上面「C/C++ 版」的文件结构表） |
-| `ks.ico` | exe / 窗口图标（用 `git add -f` 强制加进来的，因为 `.gitignore` 排除了 `*.ico`） |
+| `src/`、`CMakeLists.txt` | **C/C++ 版 · Windows** 全部源码与构建脚本（见上面「文件结构」表） |
+| `linux/` | **C/C++ 版 · Linux**，自带 `CMakeLists.txt`、`README.md` 和全部源码，可整个拷走 |
+| `deepseek_balance_cube.py` | **Python 版**主脚本，唯一必需的文件 |
+| `ks.ico` | Windows 版图标（用 `git add -f` 强制加进来的，因为 `.gitignore` 排除了 `*.ico`） |
 | `README.md` | 本说明 |
-| `mokugyo_click.wav` | **Python 版**首次运行自动生成的音效缓存，可删、可替换（C++ 版不写这个文件） |
-| `__pycache__/`、`build/`、`dist/`、`*.spec` | 运行/构建/打包产生的缓存与产物，都可以删，已在 `.gitignore` 里 |
+| `mokugyo_click.wav` | **Python 版**首次运行自动生成的音效缓存，可删、可替换（两个 C++ 版都不写这个文件） |
+| `__pycache__/`、`build/`、`linux/build/`、`dist/`、`*.spec` | 运行/构建/打包产生的缓存与产物，都可以删，已在 `.gitignore` 里 |
 
 ---
 
 ### 13. 反馈与贡献
 
-欢迎提 Issue 和 PR。改代码前建议先自查两件事：
+欢迎提 Issue 和 PR。改代码前建议先自查一遍：
 
 ```powershell
-# Python 版
-python deepseek_balance_cube.py --demo --self-test 5   # 看外观有没有画歪
-python deepseek_balance_cube.py --check-key            # 看接口链路通不通
-
-# C/C++ 版
+# C/C++ 版 · Windows
 .\build\bin\deepseek_balance_cube.exe --demo --self-test 5
 .\build\bin\deepseek_balance_cube.exe --check-key
 ```
 
-改 `src/` 里任何跟排版、字号、动画有关的代码后，记得**两边都跑一遍对照**：
-两份实现的版式是要求一致的，别只看一边。两个已知的 GDI+ 坑写在
-`src/render.cpp` 的注释里（默认 `StringFormat` 会加 1/6 em 左留白；垂直居中要用
-Tk 的 ascent+descent 模型而不是 GDI+ 含行距的行盒）。
+```bash
+# C/C++ 版 · Linux
+cd linux && ./build/bin/deepseek_balance_cube --demo --self-test 5
+./build/bin/deepseek_balance_cube --check-key
+
+# Python 版
+python deepseek_balance_cube.py --demo --self-test 5   # 看外观有没有画歪
+python deepseek_balance_cube.py --check-key            # 看接口链路通不通
+```
+
+改动跟排版、字号、动画有关的代码后，记得**三份都跑一遍对照** —— 版式是要求三边一致的，
+别只看你手上那一个平台。
+
+Linux 版还多一个不用开窗口的检查方式，SSH 里也能跑：
+
+```bash
+cd linux && ./build/bin/deepseek_balance_cube --demo --render-png /tmp/card.png
+```
+
+已知的两个 GDI+ 坑写在 `src/render.cpp` 的注释里（默认 `StringFormat` 会加 1/6 em 左留白；
+垂直居中要用 Tk 的 ascent+descent 模型而不是 GDI+ 含行距的行盒）。
 
 ---
 
