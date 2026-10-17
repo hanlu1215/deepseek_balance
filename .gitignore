@@ -5,3 +5,4 @@ __pycache__/*
 
 # CMake 构建目录
 build/
+CODEBUDDY.md

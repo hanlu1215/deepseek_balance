@@ -529,6 +529,22 @@ impl Cube {
     // ---------------------------------------------------------------- 刷新
     fn refresh(&mut self) {
         self.cancel_refresh_timer();
+
+        // 重新声明置顶：长时间挂着会被其他非置顶窗口意外覆盖，每次刷新都拨一下。
+        if self.topmost {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+
         if self.state.busy {
             return;
         }
